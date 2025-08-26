@@ -11,8 +11,8 @@
 #include <NimBLEDevice.h>
 
 // ---------- 기본값(초기 부팅/리셋용) ----------
-const char* WIFI_SSID_DEFAULT = "TP-LINK_D5DC";
-const char* WIFI_PASS_DEFAULT = "07041476150";
+const char* WIFI_SSID_DEFAULT = "";
+const char* WIFI_PASS_DEFAULT = "";
 
 struct NtripConfig {
   String host = "rts2.ngii.go.kr";
@@ -55,6 +55,7 @@ const uint32_t GGA_PERIOD_MS    = 5000;
 NimBLEServer*         pServer = nullptr;
 NimBLECharacteristic* pTx     = nullptr;
 NimBLECharacteristic* pRx     = nullptr;
+NimBLEAdvertising*    pAdv    = nullptr;
 
 // ---------- 유틸 ----------
 String degToNmea(double deg, bool isLat) {
@@ -152,6 +153,11 @@ void wifiSaveBoot() {
 bool wifiConnectNow(uint32_t ms = 15000) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  if (wifiSsid.length() == 0) {
+    Serial.println("[WiFi] SSID empty, skip connect.");
+    bleNotify("STATE wifi=disconnected\n");
+    return false;
+  }
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
   Serial.printf("[WiFi] Connecting to '%s'...", wifiSsid.c_str());
   bleNotify("STATE wifi=connecting ssid=\"" + wifiSsid + "\"\n");
@@ -251,6 +257,19 @@ void pumpRtcmToSerial() {
   }
 }
 
+// ---------- 광고 재시작 도우미 ----------
+void restartAdvertising() {
+  if (!pAdv) return;
+  // 안전하게 stop → 잠깐 대기 → start
+  if (pAdv->isAdvertising()) {
+    pAdv->stop();
+    delay(120);
+  }
+  // (광고 데이터는 setup에서 이미 채워둠)
+  pAdv->start();
+  Serial.println("[BLE] Advertising restarted");
+}
+
 // ---------- BLE Callbacks ----------
 class ServerCB : public NimBLEServerCallbacks {
   void onConnectedCommon(const char* tag) {
@@ -262,8 +281,10 @@ class ServerCB : public NimBLEServerCallbacks {
   void onDisconnectedCommon(const char* tag) {
     bleConnected = false;
     Serial.printf("[BLE] onDisconnect(%s)\n", tag);
-    bleNotify("STATE ble=disconnected\n");
-    NimBLEDevice::startAdvertising();
+    // 연결이 끊기면 광고를 확실하게 재개
+    restartAdvertising();
+    // 상태 통지(참고: notify는 연결 상태에서만 유효하므로 로그만)
+    // bleNotify("STATE ble=disconnected\n"); // 연결 없음 → notify 불가
   }
   // 두 시그니처 모두 지원(버전 호환)
   void onConnect(NimBLEServer* s) { onConnectedCommon("no-info"); }
@@ -308,6 +329,24 @@ void handleCommand(const String& cmdLine) {
       wifiConnectNow();
       return;
     }
+
+    // === 추가: 실제 Wi-Fi 끊기 처리 ===
+    if (sub == "DISCONNECT") {
+      Serial.println("[WIFI] DISCONNECT requested");
+      // NTRIP 정리
+      if (client.connected()) client.stop();
+      ntripOk = false;
+
+      // 실제 Wi-Fi 연결 끊기(무선 끄고 → STA로 복귀)
+      WiFi.disconnect(true /*wifioff*/, false /*eraseAP*/);
+      delay(120);
+      WiFi.mode(WIFI_STA);
+      WiFi.setSleep(false);
+
+      bleNotify("STATE wifi=disconnected\n");
+      return;
+    }
+
     if (sub == "AUTO") {
       args.toLowerCase();
       wifiAuto = (args.indexOf("on") >= 0);
@@ -442,11 +481,11 @@ void setup() {
   pRx->setCallbacks(new RxCB());
   svc->start();
 
-  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-  adv->addServiceUUID(NUS_SERVICE_UUID);
-  NimBLEAdvertisementData ad;  ad.setName("NTRIPBLE-C3"); adv->setAdvertisementData(ad);
-  NimBLEAdvertisementData srd; srd.setName("NTRIPBLE-C3"); adv->setScanResponseData(srd);
-  adv->start();
+  pAdv = NimBLEDevice::getAdvertising();
+  pAdv->addServiceUUID(NUS_SERVICE_UUID);
+  NimBLEAdvertisementData ad;  ad.setName("NTRIPBLE-C3"); pAdv->setAdvertisementData(ad);
+  NimBLEAdvertisementData srd; srd.setName("NTRIPBLE-C3"); pAdv->setScanResponseData(srd);
+  pAdv->start();
 
   Serial.println("[BLE] Advertising as NTRIPBLE-C3");
 
@@ -461,6 +500,11 @@ void loop() {
   if (bleConnected && millis() - lastBeat > 2000) {
     bleNotify("HEARTBEAT\n");
     lastBeat = millis();
+  }
+
+  // 광고 보조 워치독: 연결 안된 상태에서 광고가 꺼져있으면 재시작
+  if (!bleConnected && pAdv && !pAdv->isAdvertising()) {
+    restartAdvertising();
   }
 
   // WiFi 끊겼으면 정리
