@@ -1,23 +1,21 @@
 // ===== ESP32-C3 NTRIP + BLE(NUS) =====
-// - BLE NUS: RX(Write) 명령, TX(Notify) 로그/상태
-// - 부팅시 WiFi 자동 연결(옵션), 프로필 1..5 저장/로드
-// - NTRIP: 표준 v2 요청(HTTP/1.1 + Ntrip-Version:2.0 + UA 고정)로 복원
-// - 5초마다 GGA 전송, RTCM 수신을 시리얼 HEX + BLE 샘플로 노티
+// - BLE로 명령 수신/로그 알림
+// - WiFi: 수동 입력/프로필 SAVE/LOAD(1..5), AUTO on/off, 부팅 시 자동 연결
+// - NTRIP: 200 OK 받은 뒤부터만 GGA 주기 송신, RTCM 수신시 시리얼 HEX + BLE 샘플
+// - 헤더 타임아웃 12초, WiFi 절전 off, TCP noDelay
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <Preferences.h>
 #include <time.h>
+#include <Preferences.h>
 #include <NimBLEDevice.h>
 
-// ---------- BLE UUID (Nordic NUS) ----------
-#define NUS_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define NUS_CHARACTERISTIC_RX   "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // Write
-#define NUS_CHARACTERISTIC_TX   "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // Notify
+// ---------- 기본값(초기 부팅/리셋용) ----------
+const char* WIFI_SSID_DEFAULT = "TP-LINK_D5DC";
+const char* WIFI_PASS_DEFAULT = "07041476150";
 
-// ---------- NTRIP 설정 ----------
 struct NtripConfig {
-  String host  = "rts2.ngii.go.kr";
+  String host = "rts2.ngii.go.kr";
   uint16_t port = 2101;
   String mount = "VRS-RTCM31";
   String user  = "kongseal03";
@@ -26,37 +24,37 @@ struct NtripConfig {
   double lon   = 128.6970;
   double altM  = 100.0;
   int    sats  = 12;
-  float  hdop  = 1.0f;
+  float  hdop  = 1.0;
 } cfg;
 
-// "kongseal03:ngii" base64 (속도 최적화용 고정값)
-String authB64_default = "a29uZ3NlYWwwMzpuZ2lp";
+String authB64_default = "a29uZ3NlYWwwMzpuZ2lp"; // "kongseal03:ngii" base64
 
-// ---------- Wi-Fi 프로필 ----------
-struct WifiProfile {
-  String ssid;
-  String pass;
-} wcur;
-
-Preferences prefs;
-bool wifiAuto = false;   // 부팅 자동 연결
-uint8_t wifiLast = 0;    // 마지막 사용 슬롯(1..5)
-
-// ---------- 글로벌 ----------
+// ---------- 전역 ----------
 WiFiClient client;
-
-NimBLEServer*         pServer = nullptr;
-NimBLECharacteristic* pTx     = nullptr;
-NimBLECharacteristic* pRx     = nullptr;
+Preferences prefs;
 
 bool bleConnected = false;
 bool logHexToBle  = true;
 
+bool wifiAuto = true;      // 부팅 시 자동 연결
+String wifiSsid = WIFI_SSID_DEFAULT;
+String wifiPass = WIFI_PASS_DEFAULT;
+
+bool ntripOk = false;      // 200 OK 이후에만 GGA/RTCM 루프
 uint32_t lastAlive = 0;
 uint32_t lastGGA   = 0;
+
 const uint32_t ALIVE_TIMEOUT_MS = 15000;
 const uint32_t GGA_PERIOD_MS    = 5000;
-uint32_t bleRateLimiterMs = 0;
+
+// ---------- BLE NUS ----------
+#define NUS_SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define NUS_CHARACTERISTIC_RX   "6E400002-B5A3-F393-E0A9-E50E24DCCA9E" // Write
+#define NUS_CHARACTERISTIC_TX   "6E400003-B5A3-F393-E0A9-E50E24DCCA9E" // Notify
+
+NimBLEServer*         pServer = nullptr;
+NimBLECharacteristic* pTx     = nullptr;
+NimBLECharacteristic* pRx     = nullptr;
 
 // ---------- 유틸 ----------
 String degToNmea(double deg, bool isLat) {
@@ -103,11 +101,8 @@ void bleNotify(const String& s) {
 }
 void bleNotifyHexSample(const uint8_t* data, int n) {
   if (!bleConnected || !logHexToBle) return;
-  if (millis() - bleRateLimiterMs < 60) return;
-  bleRateLimiterMs = millis();
-
   String line = "RTCM ";
-  const int maxBytes = min(n, 64);
+  int maxBytes = min(n, 64);
   for (int i = 0; i < maxBytes; ++i) {
     char hex[4]; sprintf(hex, "%02X", data[i]);
     line += hex;
@@ -117,7 +112,7 @@ void bleNotifyHexSample(const uint8_t* data, int n) {
   bleNotify(line);
 }
 
-// 간단 Base64 (권한 헤더용)
+// ---- Base64 (간단) ----
 String b64(const String& plain) {
   const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   const uint8_t* p = (const uint8_t*)plain.c_str();
@@ -140,100 +135,78 @@ String makeAuthB64() {
 }
 
 // ---------- Wi-Fi ----------
-bool wifiConnectNow(uint32_t ms = 20000) {
-  if (wcur.ssid.isEmpty()) {
-    Serial.println("[WiFi] ssid empty");
-    bleNotify("STATE wifi=disconnected\n");
-    return false;
-  }
-
+void wifiLoadBoot() {
+  prefs.begin("ntripble", true);
+  wifiAuto = prefs.getBool("auto", true);
+  wifiSsid = prefs.getString("ssid", WIFI_SSID_DEFAULT);
+  wifiPass = prefs.getString("pass", WIFI_PASS_DEFAULT);
+  prefs.end();
+}
+void wifiSaveBoot() {
+  prefs.begin("ntripble", false);
+  prefs.putBool("auto", wifiAuto);
+  prefs.putString("ssid", wifiSsid);
+  prefs.putString("pass", wifiPass);
+  prefs.end();
+}
+bool wifiConnectNow(uint32_t ms = 15000) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  // erase=false 로 가볍게 끊었다가 다시 붙기
-  WiFi.disconnect();   // 기본값: erase=false
-  delay(150);
-
-  Serial.printf("[WiFi] Connecting to '%s'...\n", wcur.ssid.c_str());
-  WiFi.begin(wcur.ssid.c_str(), wcur.pass.c_str());
-
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < ms) {
+  WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
+  Serial.printf("[WiFi] Connecting to '%s'...", wifiSsid.c_str());
+  bleNotify("STATE wifi=connecting ssid=\"" + wifiSsid + "\"\n");
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < ms) {
     Serial.print(".");
     delay(500);
   }
   Serial.println();
-
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("[WiFi] Connected. IP: ");
     Serial.println(WiFi.localIP());
     bleNotify("STATE wifi=connected ip=" + WiFi.localIP().toString() + "\n");
     return true;
   }
-
-  // ✔ 여기 타입을 uint8_t(또는 int)로 받기
-  uint8_t r = WiFi.waitForConnectResult(2000);
-  Serial.printf("[WiFi] Failed. status=%d waitRes=%d\n", (int)WiFi.status(), (int)r);
+  Serial.println("[WiFi] Failed.");
   bleNotify("STATE wifi=disconnected\n");
   return false;
 }
 
-
-
-void wifiSaveSlot(uint8_t slot) {
-  if (slot < 1 || slot > 5) return;
-  prefs.begin("ntripble", false);
-  char k[16];
-  sprintf(k, "wf%d_ssid", slot); prefs.putString(k, wcur.ssid);
-  sprintf(k, "wf%d_pass", slot); prefs.putString(k, wcur.pass);
-  prefs.putUChar("wifi_last", slot);
-  prefs.end();
-  wifiLast = slot;
-}
-bool wifiLoadSlot(uint8_t slot) {
-  if (slot < 1 || slot > 5) return false;
-  prefs.begin("ntripble", true);
-  char k[16];
-  sprintf(k, "wf%d_ssid", slot); wcur.ssid = prefs.getString(k, "");
-  sprintf(k, "wf%d_pass", slot); wcur.pass = prefs.getString(k, "");
-  prefs.end();
-  return !wcur.ssid.isEmpty();
-}
-void wifiLoadSettings() {
-  prefs.begin("ntripble", true);
-  wifiAuto = prefs.getBool("wifi_auto", false);
-  wifiLast = prefs.getUChar("wifi_last", 0);
-  prefs.end();
-  if (wifiAuto && wifiLast >= 1 && wifiLast <= 5) {
-    if (wifiLoadSlot(wifiLast)) {
-      Serial.printf("[WiFi] Auto connect slot=%u (%s)\n", wifiLast, wcur.ssid.c_str());
-      wifiConnectNow();
-    }
-  }
-}
-
 // ---------- NTRIP ----------
 bool sendNtripRequest() {
-  String req;
-  req  = "GET /" + cfg.mount + " HTTP/1.1\r\n";
-  req += "Host: " + cfg.host + "\r\n";
-  req += "Ntrip-Version: Ntrip/2.0\r\n";
-  req += "User-Agent: NTRIP ntripble/0.4\r\n";
-  req += "Authorization: Basic " + makeAuthB64() + "\r\n";
-  req += "Connection: keep-alive\r\n\r\n";
+  ntripOk = false;
+  if (client.connected()) client.stop();
 
-  Serial.printf("[NTRIP] Connecting to %s:%u\n", cfg.host.c_str(), cfg.port);
-  if (!client.connect(cfg.host.c_str(), cfg.port)) {
-    Serial.println("[NTRIP] TCP connect failed.");
-    bleNotify("STATE ntrip=disconnected\n");
+  client.setNoDelay(true);
+  client.setTimeout(12000);
+
+  IPAddress ip;
+  if (!WiFi.hostByName(cfg.host.c_str(), ip)) {
+    Serial.println("[NTRIP] DNS resolve failed");
     return false;
   }
+
+  Serial.printf("[NTRIP] Connecting to %s:%u\n", cfg.host.c_str(), cfg.port);
+  if (!client.connect(ip, cfg.port)) {
+    Serial.println("[NTRIP] TCP connect failed.");
+    bleNotify("ERROR tcp_connect_failed\n");
+    return false;
+  }
+
+  // 고전 포맷(상대 서버에 가장 호환 잘됨)
+  String req;
+  req  = "GET /" + cfg.mount + " HTTP/1.0\r\n";
+  req += "User-Agent: NTRIP ntripble\r\n";
+  req += "Accept: */*\r\n";
+  req += "Authorization: Basic " + makeAuthB64() + "\r\n";
+  req += "\r\n";
 
   client.print(req);
   Serial.println("[NTRIP] Request sent.");
 
-  String header;
+  String header; header.reserve(512);
   uint32_t t0 = millis();
-  while (millis() - t0 < 6000) {
+  while (millis() - t0 < 12000) {
     while (client.available()) {
       char c = client.read();
       header += c;
@@ -245,12 +218,13 @@ bool sendNtripRequest() {
             header.startsWith("ICY 200")) {
           Serial.println("[NTRIP] 200 OK. Start streaming");
           bleNotify("STATE ntrip=connected\n");
+          ntripOk = true;
           lastAlive = millis();
-          lastGGA   = 0;
+          lastGGA   = 0;     // 즉시 첫 GGA
           return true;
         } else {
-          Serial.println("[NTRIP] Non-200. Close.");
-          bleNotify("STATE ntrip=disconnected\n");
+          Serial.println("[NTRIP] Non-200, closing.");
+          bleNotify("ERROR ntrip_non_200\n");
           client.stop();
           return false;
         }
@@ -259,7 +233,7 @@ bool sendNtripRequest() {
     delay(1);
   }
   Serial.println("[NTRIP] Header timeout.");
-  bleNotify("STATE ntrip=disconnected\n");
+  bleNotify("ERROR header_timeout\n");
   client.stop();
   return false;
 }
@@ -268,18 +242,16 @@ void pumpRtcmToSerial() {
   static uint8_t buf[512];
   int n = client.read(buf, sizeof(buf));
   if (n > 0) {
-    // Serial HEX
     for (int i = 0; i < n; ++i) {
       if ((i % 32) == 0) Serial.println();
       char hex[4]; sprintf(hex, "%02X ", buf[i]); Serial.print(hex);
     }
-    // BLE 샘플
     bleNotifyHexSample(buf, n);
     lastAlive = millis();
   }
 }
 
-// ---------- BLE 콜백 ----------
+// ---------- BLE Callbacks ----------
 class ServerCB : public NimBLEServerCallbacks {
   void onConnectedCommon(const char* tag) {
     bleConnected = true;
@@ -293,7 +265,7 @@ class ServerCB : public NimBLEServerCallbacks {
     bleNotify("STATE ble=disconnected\n");
     NimBLEDevice::startAdvertising();
   }
-  // 구버전/신버전 모두 지원
+  // 두 시그니처 모두 지원(버전 호환)
   void onConnect(NimBLEServer* s) { onConnectedCommon("no-info"); }
   void onDisconnect(NimBLEServer* s) { onDisconnectedCommon("no-info"); }
   void onConnect(NimBLEServer* s, NimBLEConnInfo& info) { onConnectedCommon("ConnInfo"); }
@@ -302,22 +274,82 @@ class ServerCB : public NimBLEServerCallbacks {
 
 void handleCommand(const String& cmdLine) {
   String s = cmdLine; String orig = s; s.trim();
-  if (s.isEmpty()) return;
+  if (s.length() == 0) return;
 
   int sp = s.indexOf(' ');
   String cmd = (sp < 0) ? s : s.substring(0, sp);
   String rest = (sp < 0) ? "" : s.substring(sp + 1);
   cmd.toUpperCase();
 
-  if (cmd == "PING") { bleNotify("PONG\n"); return; }
+  if (cmd == "PING") { bleNotify("PONG\n"); Serial.println("[BLE RX] PING"); return; }
 
-  if (cmd == "LOGHEX") {
-    String v = rest; v.trim(); v.toLowerCase();
-    if (v == "on")  { logHexToBle = true;  bleNotify("INFO loghex=on\n"); }
-    if (v == "off") { logHexToBle = false; bleNotify("INFO loghex=off\n"); }
+  // ---- WIFI ----
+  if (cmd == "WIFI") {
+    int sp2 = rest.indexOf(' ');
+    String sub = (sp2 < 0) ? rest : rest.substring(0, sp2);
+    String args = (sp2 < 0) ? ""   : rest.substring(sp2 + 1);
+    sub.toUpperCase();
+
+    if (sub == "SET") {
+      // WIFI SET ssid="..." pass="..."
+      String sssid, spass;
+      int a = args.indexOf("ssid=\"");
+      if (a >= 0) { int b = args.indexOf("\"", a+6); if (b > a) sssid = args.substring(a+6, b); }
+      a = args.indexOf("pass=\"");
+      if (a >= 0) { int b = args.indexOf("\"", a+6); if (b > a) spass = args.substring(a+6, b); }
+      if (sssid.length() > 0) wifiSsid = sssid;
+      wifiPass = spass; // 빈문자열 허용(오픈 AP)
+      wifiSaveBoot();
+      bleNotify("INFO wifi_set ok\n");
+      Serial.printf("[WIFI] SET ssid=\"%s\" pass=\"%s\"\n", wifiSsid.c_str(), wifiPass.c_str());
+      return;
+    }
+    if (sub == "CONNECT") {
+      wifiConnectNow();
+      return;
+    }
+    if (sub == "AUTO") {
+      args.toLowerCase();
+      wifiAuto = (args.indexOf("on") >= 0);
+      wifiSaveBoot();
+      bleNotify(String("INFO wifi_auto=") + (wifiAuto ? "on\n" : "off\n"));
+      return;
+    }
+    if (sub == "SAVE") {
+      // WIFI SAVE idx=1
+      int i = args.indexOf("idx=");
+      int slot = (i>=0)? args.substring(i+4).toInt(): 0;
+      if (slot<1 || slot>5){ bleNotify("ERROR idx_range_1_5\n"); return; }
+      prefs.begin("ntripble", false);
+      char key[8];
+      sprintf(key,"ws%d",slot); prefs.putString(key, wifiSsid);
+      sprintf(key,"wp%d",slot); prefs.putString(key, wifiPass);
+      prefs.end();
+      bleNotify("INFO wifi_save ok\n");
+      return;
+    }
+    if (sub == "LOAD") {
+      int i = args.indexOf("idx=");
+      int slot = (i>=0)? args.substring(i+4).toInt(): 0;
+      if (slot<1 || slot>5){ bleNotify("ERROR idx_range_1_5\n"); return; }
+      prefs.begin("ntripble", true);
+      char key[8];
+      sprintf(key,"ws%d",slot); wifiSsid = prefs.getString(key, wifiSsid);
+      sprintf(key,"wp%d",slot); wifiPass = prefs.getString(key, wifiPass);
+      prefs.end();
+      bleNotify("INFO wifi_load ok\n");
+      Serial.printf("[WIFI] LOAD -> ssid=\"%s\"\n", wifiSsid.c_str());
+      return;
+    }
+    if (sub == "STATUS") {
+      bleNotify(String("STATE wifi=") + (WiFi.status()==WL_CONNECTED?"connected ip=" + WiFi.localIP().toString():"disconnected") + "\n");
+      return;
+    }
+    bleNotify("ERROR wifi_unknown\n");
     return;
   }
 
+  // ---- NTRIP ----
   if (cmd == "SET") {
     Serial.print("[CMD] "); Serial.println(orig);
     int idx = 0;
@@ -347,92 +379,25 @@ void handleCommand(const String& cmdLine) {
     bleNotify("INFO set=ok\n");
     return;
   }
-
-  // ---- WiFi 명령 ----
-  if (cmd == "WIFI") {
-    rest.trim();
-    int sp2 = rest.indexOf(' ');
-    String sub = (sp2 < 0) ? rest : rest.substring(0, sp2);
-    String arg = (sp2 < 0) ? "" : rest.substring(sp2 + 1);
-    sub.toUpperCase();
-
-    if (sub == "SET") {
-      // WIFI SET ssid="..." pass="..."
-      auto getQuoted = [](const String& src, const char* key)->String {
-        String pat = String(key) + "=\"";
-        int i = src.indexOf(pat);
-        if (i < 0) return "";
-        i += pat.length();
-        int j = src.indexOf('"', i);
-        if (j < 0) return "";
-        return src.substring(i, j);
-      };
-      String ss = getQuoted(arg, "ssid");
-      String pw = getQuoted(arg, "pass");
-      wcur.ssid = ss;
-      wcur.pass = pw;
-      Serial.printf("[WiFi] SET ssid='%s'\n", wcur.ssid.c_str());
-      bleNotify("INFO wifi_set=ok\n");
-      return;
-    }
-    if (sub == "CONNECT") {
-      if (wifiConnectNow()) {
-        // ok
-      }
-      return;
-    }
-    if (sub == "SAVE") {
-      int i = arg.indexOf("idx=");
-      if (i < 0) { bleNotify("ERROR need idx=1..5\n"); return; }
-      int slot = arg.substring(i + 4).toInt();
-      if (slot < 1 || slot > 5) { bleNotify("ERROR idx_range_1_5\n"); return; }
-      wifiSaveSlot(slot);
-      bleNotify("INFO wifi_save=ok idx=" + String(slot) + "\n");
-      return;
-    }
-    if (sub == "LOAD") {
-      int i = arg.indexOf("idx=");
-      if (i < 0) { bleNotify("ERROR need idx=1..5\n"); return; }
-      int slot = arg.substring(i + 4).toInt();
-      if (!wifiLoadSlot(slot)) { bleNotify("ERROR wifi_load_fail\n"); return; }
-      bleNotify("INFO wifi_load=ok idx=" + String(slot) + "\n");
-      return;
-    }
-    if (sub == "AUTO") {
-      String v = arg; v.trim(); v.toLowerCase();
-      wifiAuto = (v == "on");
-      prefs.begin("ntripble", false);
-      prefs.putBool("wifi_auto", wifiAuto);
-      prefs.end();
-      bleNotify(String("INFO wifi_auto=") + (wifiAuto ? "on\n" : "off\n"));
-      return;
-    }
-    if (sub == "STATUS") {
-      if (WiFi.status() == WL_CONNECTED) {
-        bleNotify("STATE wifi=connected ip=" + WiFi.localIP().toString() + "\n");
-      } else {
-        bleNotify("STATE wifi=disconnected\n");
-      }
-      return;
-    }
-    bleNotify("ERROR wifi_unknown\n");
-    return;
-  }
-
-  // ---- NTRIP 연결 제어 ----
   if (cmd == "CONNECT") {
     Serial.println("[CMD] CONNECT (NTRIP)");
     if (WiFi.status() != WL_CONNECTED) {
-      wifiConnectNow(); // 현재 프로필로 시도
-      if (WiFi.status() != WL_CONNECTED) return;
+      if (!wifiConnectNow()) return;
     }
-    if (!client.connected()) sendNtripRequest();
+    sendNtripRequest();
     return;
   }
   if (cmd == "DISCONNECT") {
     Serial.println("[CMD] DISCONNECT (NTRIP)");
     if (client.connected()) client.stop();
+    ntripOk = false;
     bleNotify("STATE ntrip=disconnected\n");
+    return;
+  }
+  if (cmd == "LOGHEX") {
+    String v = rest; v.trim(); v.toLowerCase();
+    if (v == "on")  { logHexToBle = true;  bleNotify("INFO loghex=on\n"); }
+    if (v == "off") { logHexToBle = false; bleNotify("INFO loghex=off\n"); }
     return;
   }
 
@@ -446,25 +411,23 @@ class RxCB : public NimBLECharacteristicCallbacks {
     Serial.printf("[BLE RX] (%s) %s\n", tag, s.c_str());
     handleCommand(s);
   }
-  // 두 시그니처 모두 지원
   void onWrite(NimBLECharacteristic* ch) { handle("no-info", ch); }
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo& /*info*/) { handle("ConnInfo", ch); }
 };
 
-// ---------- Setup ----------
+// ---------- Setup / Loop ----------
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println("\n===== ESP32-C3 NTRIP + BLE(NUS) =====");
 
-  // 시간 동기 (GGA hhmmss 출력용)
+  wifiLoadBoot();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  // NTP (GGA 시각)
   configTime(0, 0, "pool.ntp.org", "time.google.com");
 
-  // 저장된 WiFi 자동연결 시도
-  wifiLoadSettings();
-  WiFi.onEvent([](WiFiEvent_t e){
-    Serial.printf("[WiFiEv] %d\n", e);
-  });
   // BLE
   NimBLEDevice::init("NTRIPBLE-C3");
   NimBLEDevice::setMTU(185);
@@ -486,20 +449,27 @@ void setup() {
   adv->start();
 
   Serial.println("[BLE] Advertising as NTRIPBLE-C3");
+
+  if (wifiAuto) {
+    wifiConnectNow();
+  }
 }
 
-// ---------- Loop ----------
 void loop() {
-  // BLE heartbeat (2s)
+  // BLE heartbeat
   static uint32_t lastBeat = 0;
   if (bleConnected && millis() - lastBeat > 2000) {
     bleNotify("HEARTBEAT\n");
     lastBeat = millis();
   }
 
-  // NTRIP 스트림 유지
-  if (client.connected()) {
-    // 5s 마다 GGA 업링크
+  // WiFi 끊겼으면 정리
+  if (WiFi.status() != WL_CONNECTED) {
+    if (client.connected()) { client.stop(); ntripOk = false; }
+  }
+
+  // NTRIP 스트림
+  if (client.connected() && ntripOk) {
     if (millis() - lastGGA >= GGA_PERIOD_MS) {
       String gga = makeGGA();
       client.print(gga);
@@ -507,7 +477,6 @@ void loop() {
       bleNotify("TX GGA " + gga);
       lastGGA = millis();
     }
-    // RTCM 수신
     if (client.available()) {
       pumpRtcmToSerial();
     } else {
@@ -515,6 +484,7 @@ void loop() {
         Serial.println("\n[NTRIP] No data. Reconnect.");
         bleNotify("STATE ntrip=disconnected\n");
         client.stop();
+        ntripOk = false;
       }
     }
   }
