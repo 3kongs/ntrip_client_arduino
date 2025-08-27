@@ -3,6 +3,9 @@
 // - WiFi: 수동 입력/프로필 SAVE/LOAD(1..5), AUTO on/off, 부팅 시 자동 연결
 // - NTRIP: 200 OK 받은 뒤부터만 GGA 주기 송신, RTCM 수신시 시리얼 HEX + BLE 샘플
 // - 헤더 타임아웃 12초, WiFi 절전 off, TCP noDelay
+//
+// [ADD] LoRa UART, UBX NAV-PVT 파서, BLE RTK 상태 전송
+// [MOD] pumpRtcmToSerial(): NTRIP→LoRa RTCM 중계 한 줄 추가
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -18,16 +21,14 @@ struct NtripConfig {
   String host = "rts2.ngii.go.kr";
   uint16_t port = 2101;
   String mount = "VRS-RTCM31";
-  String user  = "kongseal03";
-  String pass  = "ngii";
-  double lat   = 36.3520;
+  String user  = "";
+  String pass  = "";
+  double lat   = 36.3520;   // 초기 대한민국 좌표
   double lon   = 128.6970;
   double altM  = 100.0;
   int    sats  = 12;
   float  hdop  = 1.0;
 } cfg;
-
-String authB64_default = "a29uZ3NlYWwwMzpuZ2lp"; // "kongseal03:ngii" base64
 
 // ---------- 전역 ----------
 WiFiClient client;
@@ -35,6 +36,11 @@ Preferences prefs;
 
 bool bleConnected = false;
 bool logHexToBle  = true;
+
+// 광고 억제(사용자 '연결끊기' 예외 처리용)
+bool      suppressAdv = false;
+uint32_t  suppressUntilMs = 0;
+uint16_t  lastConnHandle = 0;
 
 bool wifiAuto = true;      // 부팅 시 자동 연결
 String wifiSsid = WIFI_SSID_DEFAULT;
@@ -56,6 +62,12 @@ NimBLEServer*         pServer = nullptr;
 NimBLECharacteristic* pTx     = nullptr;
 NimBLECharacteristic* pRx     = nullptr;
 NimBLEAdvertising*    pAdv    = nullptr;
+
+// ---------- [ADD] LoRa UART ----------
+#define LORA_RX_PIN 4                  // ESP32-C3 RX (LoRa TX에 연결)
+#define LORA_TX_PIN 5                  // ESP32-C3 TX (LoRa RX에 연결)
+#define LORA_BAUD   57600
+HardwareSerial LoRaUart(1);             // UART1 사용
 
 // ---------- 유틸 ----------
 String degToNmea(double deg, bool isLat) {
@@ -85,6 +97,7 @@ String makeGGA() {
   char ew = (cfg.lon >= 0) ? 'E' : 'W';
 
   char core[160];
+  // 품질 지표는 cfg.sats / cfg.hdop 사용 (RTK 품질은 별도 BLE 알림)
   sprintf(core, "GPGGA,%s,%s,%c,%s,%c,1,%02d,%.1f,%.1f,M,20.0,M,,",
           tbuf, lat.c_str(), ns, lon.c_str(), ew, cfg.sats, cfg.hdop, cfg.altM);
 
@@ -113,26 +126,62 @@ void bleNotifyHexSample(const uint8_t* data, int n) {
   bleNotify(line);
 }
 
-// ---- Base64 (간단) ----
-String b64(const String& plain) {
-  const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  const uint8_t* p = (const uint8_t*)plain.c_str();
-  size_t len = plain.length();
-  String out;
-  for (size_t i = 0; i < len; i += 3) {
-    uint32_t v = (uint32_t)p[i] << 16;
-    if (i + 1 < len) v |= (uint32_t)p[i + 1] << 8;
-    if (i + 2 < len) v |= (uint32_t)p[i + 2];
-    out += tbl[(v >> 18) & 0x3F];
-    out += tbl[(v >> 12) & 0x3F];
-    out += (i + 1 < len) ? tbl[(v >> 6) & 0x3F] : '=';
-    out += (i + 2 < len) ? tbl[v & 0x3F] : '=';
-  }
-  return out;
+// ---------- [ADD] UBX NAV-PVT 파서 ----------
+enum { U_S1, U_S2, U_CL, U_ID, U_L1, U_L2, U_PAY, U_CKA, U_CKB };
+uint8_t  u_st = U_S1, u_cls=0, u_id=0, u_cka=0, u_ckb=0;
+uint16_t u_len=0, u_idx=0;
+uint8_t  u_buf[128];                 // NAV-PVT(92B) 수용
+uint8_t  u_fixType=0, u_flags=0, u_numSV=0;
+
+void ubxReset(){ u_st=U_S1; }
+void ubxHandleNavPvt() {
+  u_fixType = u_buf[20];
+  u_flags   = u_buf[21];
+  u_numSV   = u_buf[23];
+
+  int32_t lon = *(int32_t*)&u_buf[24];
+  int32_t lat = *(int32_t*)&u_buf[28];
+  int32_t hmsl= *(int32_t*)&u_buf[36];
+
+  // 위치/고도 갱신 → NTRIP용 GGA가 자동으로 최신 위치 사용
+  cfg.lat  = lat * 1e-7;
+  cfg.lon  = lon * 1e-7;
+  cfg.altM = hmsl * 0.001;
+
+  // 위성 수 갱신 (HDOP은 NAV-PVT에 없으니 유지)
+  cfg.sats = u_numSV;
 }
-String makeAuthB64() {
-  if (cfg.user == "kongseal03" && cfg.pass == "ngii") return authB64_default;
-  return b64(cfg.user + ":" + cfg.pass);
+void ubxFeed(uint8_t b) {
+  switch (u_st) {
+    case U_S1: if (b==0xB5) u_st=U_S2; break;
+    case U_S2: if (b==0x62) u_st=U_CL; else u_st=U_S1; break;
+    case U_CL: u_cls=b; u_cka=0; u_ckb=0; u_cka+=b; u_ckb+=u_cka; u_st=U_ID; break;
+    case U_ID: u_id=b;  u_cka+=b; u_ckb+=u_cka; u_st=U_L1; break;
+    case U_L1: u_len=b; u_cka+=b; u_ckb+=u_cka; u_st=U_L2; break;
+    case U_L2: u_len|=(uint16_t)b<<8; u_cka+=b; u_ckb+=u_cka;
+               if (u_len>sizeof(u_buf)) { ubxReset(); break; }
+               u_idx=0; u_st=U_PAY; break;
+    case U_PAY:
+      u_buf[u_idx++]=b; u_cka+=b; u_ckb+=u_cka;
+      if (u_idx>=u_len) u_st=U_CKA;
+      break;
+    case U_CKA: if (u_cka==b) u_st=U_CKB; else ubxReset(); break;
+    case U_CKB:
+      if (u_ckb==b) {
+        if (u_cls==0x01 && u_id==0x07 && u_len>=92) { // NAV-PVT
+          ubxHandleNavPvt();
+        }
+      }
+      ubxReset();
+      break;
+  }
+}
+const char* rtkStateText() {
+  // flags[7:6] = carrSoln: 2=FIXED, 1=FLOAT, 0=NONE
+  uint8_t carrSoln = (u_flags >> 6) & 0x03;
+  if (carrSoln==2) return "FIXED";
+  if (carrSoln==1) return "FLOAT";
+  return "SINGLE";
 }
 
 // ---------- Wi-Fi ----------
@@ -195,16 +244,32 @@ bool sendNtripRequest() {
   Serial.printf("[NTRIP] Connecting to %s:%u\n", cfg.host.c_str(), cfg.port);
   if (!client.connect(ip, cfg.port)) {
     Serial.println("[NTRIP] TCP connect failed.");
-    bleNotify("ERROR tcp_connect_failed\n");
+    bleNotify("STATE ntrip=disconnected\n");
     return false;
   }
 
-  // 고전 포맷(상대 서버에 가장 호환 잘됨)
+  // Basic Auth
+  String authB64;
+  {
+    String up = cfg.user + String(":") + cfg.pass;
+    const char* tbl = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const uint8_t* b = (const uint8_t*)up.c_str(); size_t L = up.length();
+    for (size_t i = 0; i < L; i += 3) {
+      uint32_t v = (uint32_t)b[i] << 16;
+      if (i + 1 < L) v |= (uint32_t)b[i + 1] << 8;
+      if (i + 2 < L) v |= (uint32_t)b[i + 2];
+      authB64 += tbl[(v >> 18) & 0x3F];
+      authB64 += tbl[(v >> 12) & 0x3F];
+      authB64 += (i + 1 < L) ? tbl[(v >> 6) & 0x3F] : '=';
+      authB64 += (i + 2 < L) ? tbl[v & 0x3F] : '=';
+    }
+  }
+
   String req;
   req  = "GET /" + cfg.mount + " HTTP/1.0\r\n";
   req += "User-Agent: NTRIP ntripble\r\n";
   req += "Accept: */*\r\n";
-  req += "Authorization: Basic " + makeAuthB64() + "\r\n";
+  req += "Authorization: Basic " + authB64 + "\r\n";
   req += "\r\n";
 
   client.print(req);
@@ -230,8 +295,8 @@ bool sendNtripRequest() {
           return true;
         } else {
           Serial.println("[NTRIP] Non-200, closing.");
-          bleNotify("ERROR ntrip_non_200\n");
           client.stop();
+          bleNotify("STATE ntrip=disconnected\n");
           return false;
         }
       }
@@ -239,11 +304,12 @@ bool sendNtripRequest() {
     delay(1);
   }
   Serial.println("[NTRIP] Header timeout.");
-  bleNotify("ERROR header_timeout\n");
   client.stop();
+  bleNotify("STATE ntrip=disconnected\n");
   return false;
 }
 
+// ---------- [MOD] NTRIP RTCM → HEX 로그 + BLE 샘플 + LoRa 송신 ----------
 void pumpRtcmToSerial() {
   static uint8_t buf[512];
   int n = client.read(buf, sizeof(buf));
@@ -254,20 +320,34 @@ void pumpRtcmToSerial() {
     }
     bleNotifyHexSample(buf, n);
     lastAlive = millis();
+
+    // ===== [ADD] LoRa로 RTCM 중계 =====
+    LoRaUart.write(buf, n);
   }
 }
 
 // ---------- 광고 재시작 도우미 ----------
 void restartAdvertising() {
   if (!pAdv) return;
-  // 안전하게 stop → 잠깐 대기 → start
+  if (suppressAdv && millis() < suppressUntilMs) return;
+  if (suppressAdv && millis() >= suppressUntilMs) suppressAdv = false;
+
   if (pAdv->isAdvertising()) {
     pAdv->stop();
     delay(120);
   }
-  // (광고 데이터는 setup에서 이미 채워둠)
   pAdv->start();
   Serial.println("[BLE] Advertising restarted");
+}
+
+// ---------- 상태 즉시 방송 ----------
+void broadcastCurrentState() {
+  String w = (WiFi.status()==WL_CONNECTED)
+             ? String("STATE wifi=connected ip=") + WiFi.localIP().toString() + "\n"
+             : String("STATE wifi=disconnected\n");
+  bleNotify(w);
+  String n = String("STATE ntrip=") + ( (client.connected() && ntripOk) ? "connected\n" : "disconnected\n");
+  bleNotify(n);
 }
 
 // ---------- BLE Callbacks ----------
@@ -277,20 +357,24 @@ class ServerCB : public NimBLEServerCallbacks {
     Serial.printf("[BLE] onConnect(%s)\n", tag);
     bleNotify("STATE ble=connected\n");
     bleNotify("HELLO from ESP32-C3\n");
+    broadcastCurrentState();
   }
   void onDisconnectedCommon(const char* tag) {
     bleConnected = false;
     Serial.printf("[BLE] onDisconnect(%s)\n", tag);
-    // 연결이 끊기면 광고를 확실하게 재개
     restartAdvertising();
-    // 상태 통지(참고: notify는 연결 상태에서만 유효하므로 로그만)
-    // bleNotify("STATE ble=disconnected\n"); // 연결 없음 → notify 불가
   }
-  // 두 시그니처 모두 지원(버전 호환)
+
   void onConnect(NimBLEServer* s) { onConnectedCommon("no-info"); }
   void onDisconnect(NimBLEServer* s) { onDisconnectedCommon("no-info"); }
-  void onConnect(NimBLEServer* s, NimBLEConnInfo& info) { onConnectedCommon("ConnInfo"); }
-  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info) { onDisconnectedCommon("ConnInfo"); }
+
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& info) {
+    lastConnHandle = info.getConnHandle();
+    onConnectedCommon("ConnInfo");
+  }
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info) {
+    onDisconnectedCommon("ConnInfo");
+  }
 };
 
 void handleCommand(const String& cmdLine) {
@@ -304,6 +388,24 @@ void handleCommand(const String& cmdLine) {
 
   if (cmd == "PING") { bleNotify("PONG\n"); Serial.println("[BLE RX] PING"); return; }
 
+  if (cmd == "BLE") {
+    String sub = rest; sub.trim(); sub.toUpperCase();
+    if (sub == "BYE") {
+      bleNotify("INFO bye\n");
+      suppressAdv = true;
+      suppressUntilMs = millis() + 12000;
+      if (lastConnHandle != 0 && pServer) {
+        Serial.println("[BLE] BYE: disconnect current central");
+        pServer->disconnect(lastConnHandle);
+      }
+      return;
+    }
+    bleNotify("ERROR ble_unknown\n");
+    return;
+  }
+
+  if (cmd == "STATUS") { broadcastCurrentState(); return; }
+
   // ---- WIFI ----
   if (cmd == "WIFI") {
     int sp2 = rest.indexOf(' ');
@@ -312,7 +414,6 @@ void handleCommand(const String& cmdLine) {
     sub.toUpperCase();
 
     if (sub == "SET") {
-      // WIFI SET ssid="..." pass="..."
       String sssid, spass;
       int a = args.indexOf("ssid=\"");
       if (a >= 0) { int b = args.indexOf("\"", a+6); if (b > a) sssid = args.substring(a+6, b); }
@@ -322,31 +423,21 @@ void handleCommand(const String& cmdLine) {
       wifiPass = spass; // 빈문자열 허용(오픈 AP)
       wifiSaveBoot();
       bleNotify("INFO wifi_set ok\n");
-      Serial.printf("[WIFI] SET ssid=\"%s\" pass=\"%s\"\n", wifiSsid.c_str(), wifiPass.c_str());
+      Serial.printf("[WIFI] SET ssid=\"%s\"\n", wifiSsid.c_str());
       return;
     }
-    if (sub == "CONNECT") {
-      wifiConnectNow();
-      return;
-    }
-
-    // === 추가: 실제 Wi-Fi 끊기 처리 ===
+    if (sub == "CONNECT") { wifiConnectNow(); return; }
     if (sub == "DISCONNECT") {
       Serial.println("[WIFI] DISCONNECT requested");
-      // NTRIP 정리
       if (client.connected()) client.stop();
       ntripOk = false;
-
-      // 실제 Wi-Fi 연결 끊기(무선 끄고 → STA로 복귀)
       WiFi.disconnect(true /*wifioff*/, false /*eraseAP*/);
       delay(120);
       WiFi.mode(WIFI_STA);
       WiFi.setSleep(false);
-
       bleNotify("STATE wifi=disconnected\n");
       return;
     }
-
     if (sub == "AUTO") {
       args.toLowerCase();
       wifiAuto = (args.indexOf("on") >= 0);
@@ -355,7 +446,6 @@ void handleCommand(const String& cmdLine) {
       return;
     }
     if (sub == "SAVE") {
-      // WIFI SAVE idx=1
       int i = args.indexOf("idx=");
       int slot = (i>=0)? args.substring(i+4).toInt(): 0;
       if (slot<1 || slot>5){ bleNotify("ERROR idx_range_1_5\n"); return; }
@@ -390,7 +480,6 @@ void handleCommand(const String& cmdLine) {
 
   // ---- NTRIP ----
   if (cmd == "SET") {
-    Serial.print("[CMD] "); Serial.println(orig);
     int idx = 0;
     while (idx < rest.length()) {
       while (idx < rest.length() && rest[idx] == ' ') idx++;
@@ -419,7 +508,6 @@ void handleCommand(const String& cmdLine) {
     return;
   }
   if (cmd == "CONNECT") {
-    Serial.println("[CMD] CONNECT (NTRIP)");
     if (WiFi.status() != WL_CONNECTED) {
       if (!wifiConnectNow()) return;
     }
@@ -427,7 +515,6 @@ void handleCommand(const String& cmdLine) {
     return;
   }
   if (cmd == "DISCONNECT") {
-    Serial.println("[CMD] DISCONNECT (NTRIP)");
     if (client.connected()) client.stop();
     ntripOk = false;
     bleNotify("STATE ntrip=disconnected\n");
@@ -489,6 +576,9 @@ void setup() {
 
   Serial.println("[BLE] Advertising as NTRIPBLE-C3");
 
+  // [ADD] LoRa UART 시작
+  LoRaUart.begin(LORA_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+
   if (wifiAuto) {
     wifiConnectNow();
   }
@@ -502,9 +592,12 @@ void loop() {
     lastBeat = millis();
   }
 
-  // 광고 보조 워치독: 연결 안된 상태에서 광고가 꺼져있으면 재시작
-  if (!bleConnected && pAdv && !pAdv->isAdvertising()) {
-    restartAdvertising();
+  // 광고 워치독
+  if (!bleConnected && pAdv) {
+    if (suppressAdv && millis() >= suppressUntilMs) suppressAdv = false;
+    if (!suppressAdv && !pAdv->isAdvertising()) {
+      restartAdvertising();
+    }
   }
 
   // WiFi 끊겼으면 정리
@@ -514,6 +607,7 @@ void loop() {
 
   // NTRIP 스트림
   if (client.connected() && ntripOk) {
+    // GGA 주기 송신 (cfg.lat/lon/alt는 LoRa NAV-PVT로 자동 갱신됨)
     if (millis() - lastGGA >= GGA_PERIOD_MS) {
       String gga = makeGGA();
       client.print(gga);
@@ -522,7 +616,7 @@ void loop() {
       lastGGA = millis();
     }
     if (client.available()) {
-      pumpRtcmToSerial();
+      pumpRtcmToSerial(); // [MOD] 내부에서 LoRa로 RTCM도 중계함
     } else {
       if (millis() - lastAlive > ALIVE_TIMEOUT_MS) {
         Serial.println("\n[NTRIP] No data. Reconnect.");
@@ -531,6 +625,21 @@ void loop() {
         ntripOk = false;
       }
     }
+  }
+
+  // [ADD] LoRa에서 UBX NAV-PVT 수신 → 파싱
+  while (LoRaUart.available()) {
+    uint8_t b = (uint8_t)LoRaUart.read();
+    ubxFeed(b);
+  }
+
+  // [ADD] 1초마다 RTK 상태를 BLE로 알림 (앱 상단 인디케이터용)
+  static uint32_t lastStat = 0;
+  if (millis() - lastStat >= 1000) {
+    lastStat = millis();
+    char line[64];
+    snprintf(line, sizeof(line), "STAT:{\"rtk\":\"%s\",\"sv\":%u}\n", rtkStateText(), (unsigned)u_numSV);
+    bleNotify(String(line));
   }
 
   delay(5);
