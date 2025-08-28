@@ -5,8 +5,8 @@
 // - 헤더 타임아웃 12초, WiFi 절전 off, TCP noDelay
 //
 // [ADD] LoRa UART, UBX NAV-PVT 파서, BLE RTK 상태 전송
-// [MOD] pumpRtcmToSerial(): NTRIP→LoRa RTCM 중계
-// [NOTE] 자동 연결 전부 제거(부팅/ BLE 연결 후에도 시도 안함). 사용자는 앱에서 수동 CONNECT.
+// [MOD] RTCM→LoRa 중계, 수동 연결만 유지(자동 연결 제거)
+// [FIX] 앱 표시 동기화를 위해 연결/끊김 시 INFO wifi_ssid / INFO ntrip_mount 송신
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -179,7 +179,6 @@ const char* rtkStateText() {
 // ---------- Wi-Fi ----------
 void wifiLoadBoot() {
   prefs.begin("ntripble", true);
-  // 자동연결 개념 제거: 저장만 유지
   wifiSsid = prefs.getString("ssid", WIFI_SSID_DEFAULT);
   wifiPass = prefs.getString("pass", WIFI_PASS_DEFAULT);
   prefs.end();
@@ -196,6 +195,7 @@ bool wifiConnectNow(uint32_t ms = 15000) {
   if (wifiSsid.length() == 0) {
     Serial.println("[WiFi] SSID empty, skip connect.");
     bleNotify("STATE wifi=disconnected\n");
+    bleNotify("INFO wifi_ssid=\"-\"\n");
     return false;
   }
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
@@ -218,6 +218,7 @@ bool wifiConnectNow(uint32_t ms = 15000) {
   }
   Serial.println("[WiFi] Failed.");
   bleNotify("STATE wifi=disconnected\n");
+  bleNotify("INFO wifi_ssid=\"-\"\n");
   return false;
 }
 
@@ -232,6 +233,8 @@ bool sendNtripRequest() {
   IPAddress ip;
   if (!WiFi.hostByName(cfg.host.c_str(), ip)) {
     Serial.println("[NTRIP] DNS resolve failed");
+    bleNotify("STATE ntrip=disconnected\n");
+    bleNotify("INFO ntrip_mount=\"-\"\n");
     return false;
   }
 
@@ -239,6 +242,7 @@ bool sendNtripRequest() {
   if (!client.connect(ip, cfg.port)) {
     Serial.println("[NTRIP] TCP connect failed.");
     bleNotify("STATE ntrip=disconnected\n");
+    bleNotify("INFO ntrip_mount=\"-\"\n");
     return false;
   }
 
@@ -292,6 +296,7 @@ bool sendNtripRequest() {
           Serial.println("[NTRIP] Non-200, closing.");
           client.stop();
           bleNotify("STATE ntrip=disconnected\n");
+          bleNotify("INFO ntrip_mount=\"-\"\n");
           return false;
         }
       }
@@ -301,6 +306,7 @@ bool sendNtripRequest() {
   Serial.println("[NTRIP] Header timeout.");
   client.stop();
   bleNotify("STATE ntrip=disconnected\n");
+  bleNotify("INFO ntrip_mount=\"-\"\n");
   return false;
 }
 
@@ -344,8 +350,7 @@ class ServerCB : public NimBLEServerCallbacks {
     Serial.printf("[BLE] onConnect(%s)\n", tag);
     bleNotify("STATE ble=connected\n");
     bleNotify("HELLO from ESP32-C3\n");
-    // 자동 연결 없음. 현재 상태만 알림.
-    broadcastCurrentState();
+    broadcastCurrentState(); // 자동 연결 없음
   }
   void onDisconnectedCommon(const char* tag) {
     bleConnected = false;
@@ -417,6 +422,7 @@ void handleCommand(const String& cmdLine) {
       WiFi.mode(WIFI_STA);
       WiFi.setSleep(false);
       bleNotify("STATE wifi=disconnected\n");
+      bleNotify("INFO wifi_ssid=\"-\"\n");
       return;
     }
     if (sub == "SAVE") {
@@ -482,7 +488,7 @@ void handleCommand(const String& cmdLine) {
     return;
   }
   if (cmd == "CONNECT") {
-    if (WiFi.status() != WL_CONNECTED) { bleNotify("STATE ntrip=disconnected\n"); return; }
+    if (WiFi.status() != WL_CONNECTED) { bleNotify("STATE ntrip=disconnected\n"); bleNotify("INFO ntrip_mount=\"-\"\n"); return; }
     sendNtripRequest();
     return;
   }
@@ -490,6 +496,7 @@ void handleCommand(const String& cmdLine) {
     if (client.connected()) client.stop();
     ntripOk = false;
     bleNotify("STATE ntrip=disconnected\n");
+    bleNotify("INFO ntrip_mount=\"-\"\n");
     return;
   }
   if (cmd == "LOGHEX") {
@@ -547,8 +554,6 @@ void setup() {
   Serial.println("[BLE] Advertising as NTRIPBLE-C3");
 
   LoRaUart.begin(LORA_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
-
-  // 자동 연결 없음 (부팅 시)
 }
 
 void loop() {
@@ -582,6 +587,7 @@ void loop() {
     } else if (millis() - lastAlive > ALIVE_TIMEOUT_MS) {
       Serial.println("\n[NTRIP] No data. Reconnect.");
       bleNotify("STATE ntrip=disconnected\n");
+      bleNotify("INFO ntrip_mount=\"-\"\n");
       client.stop();
       ntripOk = false;
     }
